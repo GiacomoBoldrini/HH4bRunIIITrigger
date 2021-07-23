@@ -4,6 +4,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 from glob import glob
 import datetime
+from itertools import product
+from tqdm import tqdm
+import multiprocessing 
+import time
 
 
 @ROOT.Numba.Declare(["RVec<float>", "RVec<float>", "float", "int"], "bool")
@@ -43,57 +47,80 @@ def L1Filter(l1bits):
     
     return False
 
-class newTrigger:
+@ROOT.Numba.Declare(["RVec<unsigned int>"], "bool")
+def L1FilterAdHoc(l1bits):
+    # Uggly but needed for c++ conversion
+    # numba does not know python any() builtin
+    i = 0
+    if l1bits[7]  or l1bits[2]: return True
+    else: return False
+
+class newTrigger(multiprocessing.Process):
     
     def __init__(self, df):
+        
+        multiprocessing.Process.__init__(self)
+        
         # df is a RootDataFrames
         self.df = df
         
         # List of list with two entries, the first element is the base cut for the 
         # Filter method while the second entry is the parameter for a trigger filter
         self.Selections = [
-            ["Numba::L1FilterPrescaled(trigger_l1_pass, trigger_l1_prescale)", []],
+            ["Numba::L1FilterAdHoc(trigger_l1_pass)", []],
             ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [0, 0, 60]],
             ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [1, 1, 40]],
             ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [2, 2, 30]],
             ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [0, 0, 70]],
             ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [1, 1, 50]],
-            ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [2, 2, 45]],
+            ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [2, 2, 40]],
             ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [3, 3, 25]],
             ["Numba::btagSelector(jet_hlt_pt, jet_hlt_pnet_probb, {}, {})" , [0.5, 0]],
             ["Numba::btagSelector(jet_hlt_pt, jet_hlt_pnet_probb, {}, {})" , [0.3, 1]]
         ]
         
         # Stores the count of events at each filter in a sequential manner
-        self.bits = []
+        # Shared between process in asynchronous way
+        self.bits = multiprocessing.Array('i', range(len(self.Selections)))
+        
+        # Set a dummy id
+        self.id_ = 0
         
         
     def modifySel(self, idx, new):
         # Allows to change a selection item
         self.Selections[idx] = new
         
+    def setSelection(self, selections):
+        self.Selections = selections
+        
+    def setRange(self, r_):
+        # multiprocessing
+        self.df = self.df.Range(r_[0], r_[1])
+        
     def setDF(self, df):
         # Allows to change the dataset on which the trigger selection is performed
         self.df = df
         
-    def runTrigger(self):
+    def run(self):
         # Runs all the trigger selection with Filter method 
         # Stores the result in the bits
-        
-        #reset bit count
-        self.bits = []
         
         # Value-copy the dataframe. Actually the Filter option does not cancel events 
         # from the datafram but only masks them but i do not know how to cancel previous selections.
         df = self.df
         
         # Running selection for each filter defined in the Selection attribute
-        for sel in self.Selections:
+        for i, sel in enumerate(self.Selections):
             cut  = sel[0].format(*sel[1]) # Complete the cut string with pars
             df = df.Filter(cut)
-            c = df.Count() #retrieving the count at this stage
-            print(c.GetValue()) # Verbosity
-            self.bits.append(c.GetValue())
+            c = df.Count().GetValue() #retrieving the count at this stage
+            # print(c.GetValue()) # Verbosity
+            #if hasattr(self, "id_"):
+            #    print(c, self.id_)
+            #else:
+            #    print(c)
+            self.bits[i] = c
         
     def passed(self):
         # Return overall number of events accepted by the full trigger
@@ -102,21 +129,25 @@ class newTrigger:
     def getBits(self):
         # Get full history of selections
         return self.bits
+    
+    
+def makeRange(tot, nproc):
+    step_size = tot // nproc
+    range_ = np.arange(0, tot, step_size)
+    # last step would be [tot - step_size, 0], tells root to take every entry until eof
+    range_ = np.append(range_, 0)
+    range_ = [int(i) for i in range_]
+    return range_
         
         
 if __name__ == "__main__":
     
     # Enable multitheading
-    ROOT.ROOT.EnableImplicitMT(6)
-    
-    #start chronometer 
-    begin_time = datetime.datetime.now()
+    nproc = 4
     
     # Retireving all files for signal and background
-    f_sig = glob("../roots/ggHH_4b_kl_1.0/*")
     f_bkg  = glob("../roots/Ephemeral8/*.root") + glob("../roots/Ephemeral7/*.root") + glob("../roots/Ephemeral6/*.root") + glob("../roots/Ephemeral5/*.root") + glob("../roots/Ephemeral4/*.root") + glob("../roots/Ephemeral3/*.root") + glob("../roots/Ephemeral2/*.root") + glob("../roots/Ephemeral1/*.root")
-
-
+    
     
     # Build root dataframes to analyse data
     t_sig=ROOT.RDataFrame("dnntree/tree", "../roots/ggHH_4b_kl_1.0/*.root")
@@ -133,17 +164,196 @@ if __name__ == "__main__":
     
     print("Events count. Sig: {}, Bkg: {}".format(tot_sig, tot_bkg))
     
-    #build trigger and compute benchmark signal acceptanxce
-    tr = newTrigger(t_sig)
-    tr.runTrigger()
-    sig_acc = float(tr.passed())/tot_sig
+    # making ranges for multiprocess
+    range_signal = makeRange(tot_sig, nproc)
+    range_bkg = makeRange(tot_bkg, nproc)
     
-    #compute benchmark data  zerobias acceptance
-    # L1 selection does nothing on this 
-    tr.setDF(t_bkg)
-    tr.runTrigger()
-    bkg_acc = float(tr.passed())/tot_bkg 
+    #start chronometer 
+    begin_time = datetime.datetime.now()
+    
+    begin_time = datetime.datetime.now()
+    
+    # Now multiprocessing
+    the_trs = []
+
+    for i in range(len(range_signal)-1):
+        t_ = newTrigger(t_sig)
+        t_.setRange([range_signal[i], range_signal[i+1]])
+        t_.id_ = i
+        the_trs.append(t_)
+        the_trs[i].start()
+        
+    jobs = list(the_trs)
+    
+    # wait until jobs finish
+    while len(jobs) > 0:
+        jobs = [job for job in jobs if job.is_alive()]
+        time.sleep(1)
+
+    print('*** All jobs finished ***')
+    print("Parallel time: {}".format(datetime.datetime.now() - begin_time))
+        
+    # collect results
+    bench_sig_acc =  0
+    for i in range(len(the_trs)):
+        bench_sig_acc += the_trs[i].passed()
+        
+    bench_sig_acc = float(bench_sig_acc)/tot_sig
+    
+    the_trs = []
+
+    for i in range(len(range_signal)-1):
+        t_ = newTrigger(t_bkg)
+        t_.setRange([range_bkg[i], range_bkg[i+1]])
+        t_.id_ = i
+        the_trs.append(t_)
+        the_trs[i].start()
+        
+    jobs = list(the_trs)
+        
+    # wait until jobs finish
+    while len(jobs) > 0:
+        jobs = [job for job in jobs if job.is_alive()]
+        time.sleep(1)
+
+    print('*** All jobs finished ***')
+        
+    # collect results
+    bench_bkg_acc =  0
+    for trig in the_trs:
+        bench_bkg_acc += trig.passed()
+        
+    bench_bkg_acc = float(bench_bkg_acc)/tot_bkg 
+        
+        
+    print("Parallel time: {}".format(datetime.datetime.now() - begin_time))
+    print("Benchmark performance. Signal: {:.3f}%, Background: {:.3f}%".format(bench_sig_acc*100, bench_bkg_acc*100))
     
     
-    print(datetime.datetime.now() - begin_time)
-    print("Benchmark performance. Signal: {:.3f}%, Background: {:.3f}%".format(sig_acc*100, bkg_acc*100))
+    #  Now moving to the scan
+    
+    # Requires too much time
+    # thresholds = list(product(
+    #     *[
+    #         np.arange(40,80,15), # Leading calo pt th
+    #         np.arange(30,50,10), # 2nd Leading calo pt th
+    #         np.arange(20,40,2), # 3rd Leading calo pt th
+    #         np.arange(65,95,15), # Leading pf pt th
+    #         np.arange(40,80,10), # 2nd Leading pf pt th
+    #         np.arange(30,60,5), # 3rd Leading pf pt th
+    #         np.arange(20,30,2), # 3rd Leading pf pt th
+    #         np.arange(0.3,0.7,0.1), # Leading b-tag
+    #         np.arange(0.1,0.5,0.1), # 2nd Leading b-tag
+    #     ]
+    # ))
+    
+    # simple try with onliu btag filters 
+    thresholds = list(product(
+        *[
+            np.array([60]), # Leading calo pt th
+            np.array([40]), # 2nd Leading calo pt th
+            np.array([30]), # 3rd Leading calo pt th
+            np.array([70]), # Leading pf pt th
+            np.array([50]), # 2nd Leading pf pt th
+            np.array([30, 40, 50]), # 3rd Leading pf pt th
+            np.array([25]), # 3rd Leading pf pt th
+            np.arange(0.4,0.6,0.05), # Leading b-tag
+            np.arange(0.2,0.4,0.05), # 2nd Leading b-tag
+        ]
+    ))
+    
+    Selections = [
+            ["Numba::L1FilterAdHoc(trigger_l1_pass)", []],
+            ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [0, 0, 60]],
+            ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [1, 1, 40]],
+            ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [2, 2, 30]],
+            ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [0, 0, 70]],
+            ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [1, 1, 50]],
+            ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [2, 2, 40]],
+            ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [3, 3, 25]],
+            ["Numba::btagSelector(jet_hlt_pt, jet_hlt_pnet_probb, {}, {})" , [0.5, 0]],
+            ["Numba::btagSelector(jet_hlt_pt, jet_hlt_pnet_probb, {}, {})" , [0.3, 1]]
+        ]
+    
+    f = open("scan.txt", "w")
+    f.write("{} {}\n".format(bench_sig_acc, bench_bkg_acc))
+    
+    for idx in tqdm(range(len(thresholds))):
+        combo = thresholds[idx]
+        
+        # modify selections object
+        for i_ in range(len(combo)):
+            s = Selections[i_+1]
+            #first seven for pt 
+            if i_ < 7:
+                Selections[i_+1][1][2] =  combo[i_]
+            else:
+                Selections[i_+1][1][0] =  round(combo[i_],2)
+                
+        # Now selection is modified we can  import it into the trigger
+        
+        print(Selections)
+        
+        # Signal
+        the_trs = []
+
+        # Ddefine and setup the triggers
+        for i in range(len(range_signal)-1):
+            t_ = newTrigger(t_sig)
+            t_.setRange([range_signal[i], range_signal[i+1]])
+            t_.id_ = i
+            t_.setSelection(Selections)
+            the_trs.append(t_)
+            the_trs[i].start()
+            
+        jobs = list(the_trs)
+        
+        # wait until jobs finish
+        while len(jobs) > 0:
+            jobs = [job for job in jobs if job.is_alive()]
+            time.sleep(1)
+
+        print('*** All jobs finished ***')
+        print("Parallel time: {}".format(datetime.datetime.now() - begin_time))
+            
+        # collect results
+        sig_acc =  0
+        for i in range(len(the_trs)):
+            sig_acc += the_trs[i].passed()
+        
+        # compute acceptance
+        sig_acc = float(sig_acc)/tot_sig
+        
+        # Background
+        the_trs = []
+        
+        for i in range(len(range_signal)-1):
+            t_ = newTrigger(t_bkg)
+            t_.setRange([range_bkg[i], range_bkg[i+1]])
+            t_.id_ = i
+            t_.setSelection(Selections)
+            the_trs.append(t_)
+            the_trs[i].start()
+            
+        jobs = list(the_trs)
+            
+        # wait until jobs finish
+        while len(jobs) > 0:
+            jobs = [job for job in jobs if job.is_alive()]
+            time.sleep(1)
+
+        print('*** All jobs finished ***')
+            
+        # collect results
+        bkg_acc =  0
+        for trig in the_trs:
+            bkg_acc += trig.passed()
+            
+        bkg_acc = float(bkg_acc)/tot_bkg 
+        
+        tow = " ".join([str(cut) for cut in combo])
+        print(tow)
+        f.write("{} {} {}\n".format(sig_acc, bkg_acc, tow))
+        
+        
+    f.close()
