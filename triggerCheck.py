@@ -9,6 +9,34 @@ from tqdm import tqdm
 import multiprocessing 
 import time
 
+@ROOT.Numba.Declare(["RVec<float>", "RVec<float>", "RVec<float>", "RVec<float>", "RVec<float>", "float", "int"], "bool")
+def btagSelectorDenom(pt, bb, bc, busd, bg, th,c):
+    # Uggly but needed for c++ conversion
+    if len(pt)  == 0: return False
+    bt_pt30 = []
+    for i,j,k,l,m in zip(pt, bb,  bc, busd, bg):
+        if i > 30: bt_pt30.append(j / (j +  k + l + m))
+        
+    count = 0
+    for i in bt_pt30:
+        if i > th: count += 1
+    
+    return count > c
+
+
+@ROOT.Numba.Declare(["RVec<float>", "RVec<float>", "RVec<float>", "RVec<float>", "RVec<float>", "float", "int"], "bool")
+def btagSelectorDenom_2(pt, bb, bc, busd, bg, th,c):
+    # Uggly but needed for c++ conversion
+    if len(pt)  == 0: return False
+    bt_pt30 = []
+    for i,j,k,l,m in zip(pt, bb,  bc, busd, bg):
+        if i > 30: bt_pt30.append(j / (j +  k + l + m))
+    
+    bt_pt30 = np.array(bt_pt30)
+    bt_pt30[::-1].sort()
+    
+    if bt_pt30[c] > th: return True 
+    else: return False
 
 @ROOT.Numba.Declare(["RVec<float>", "RVec<float>", "float", "int"], "bool")
 def btagSelector(pt, b, th,c):
@@ -49,11 +77,38 @@ def L1Filter(l1bits):
 
 @ROOT.Numba.Declare(["RVec<unsigned int>"], "bool")
 def L1FilterAdHoc(l1bits):
-    # Uggly but needed for c++ conversion
-    # numba does not know python any() builtin
-    i = 0
-    if l1bits[7]  or l1bits[2]: return True
-    else: return False
+    
+    if l1bits[7]: return True 
+    if l1bits[0]: return True 
+    if l1bits[5]: return True
+    
+    return False
+    
+    
+@ROOT.Numba.Declare(["RVec<float>", "RVec<float>"], "bool")
+def METL1(l1jpt, l1jeta):
+    
+    if len(l1jpt) == 0: return False
+    ht = 0
+    
+    for i in range(len(l1jpt)):
+        if l1jpt[i] > 30 and abs(l1jeta[i]) < 2.5: ht += l1jpt[i]
+        
+    if ht > 240: return  True 
+    else: return  False 
+
+@ROOT.Numba.Declare(["RVec<float>", "RVec<float>", "RVec<float>"], "bool")
+def MuonL1(mupt, mueta, muqual):
+    
+    if len(mupt) == 0: return False
+    mupt_ = 0
+    for i  in range(len(mupt)):
+        if abs(mueta[i]) < 2.4 and muqual[i] >= 12: 
+            if mupt[i] > mupt_: mupt_ = mupt[i]
+    
+    if mupt_ > 6: return  True 
+    else: return  False
+    
 
 class newTrigger(multiprocessing.Process):
     
@@ -67,7 +122,8 @@ class newTrigger(multiprocessing.Process):
         # List of list with two entries, the first element is the base cut for the 
         # Filter method while the second entry is the parameter for a trigger filter
         self.Selections = [
-            ["Numba::L1FilterAdHoc(trigger_l1_pass)", []],
+            ["Numba::L1FilterAdHoc(trigger_l1_pass) || (Numba::METL1(trigger_l1_jet_pt,trigger_l1_jet_eta) && Numba::MuonL1(trigger_l1_muon_pt, trigger_l1_muon_eta, trigger_l1_muon_qual))", []],
+            #["Numba::L1FilterAdHoc(trigger_l1_pass)", []],
             ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [0, 0, 60]],
             ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [1, 1, 40]],
             ["calojet_hlt_pt.size() > {} && calojet_hlt_pt[{}] > {}" , [2, 2, 30]],
@@ -75,8 +131,8 @@ class newTrigger(multiprocessing.Process):
             ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [1, 1, 50]],
             ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [2, 2, 40]],
             ["jet_hlt_pt.size() > {} && jet_hlt_pt[{}] > {}" , [3, 3, 25]],
-            ["Numba::btagSelector(jet_hlt_pt, jet_hlt_pnet_probb, {}, {})" , [0.5, 0]],
-            ["Numba::btagSelector(jet_hlt_pt, jet_hlt_pnet_probb, {}, {})" , [0.3, 1]]
+            ["Numba::btagSelectorDenom_2(jet_hlt_pt, jet_hlt_pnet_probb, jet_hlt_pnet_probc, jet_hlt_pnet_probuds, jet_hlt_pnet_probg, {}, {})" , [0.5, 0]],
+            ["Numba::btagSelectorDenom_2(jet_hlt_pt, jet_hlt_pnet_probb, jet_hlt_pnet_probc, jet_hlt_pnet_probuds, jet_hlt_pnet_probg, {}, {})" , [0.3, 1]]
         ]
         
         # Stores the count of events at each filter in a sequential manner
@@ -154,7 +210,7 @@ if __name__ == "__main__":
     t_bkg=ROOT.RDataFrame("dnntree/tree", f_bkg)
     
     # Filter events with negative weight
-    t_sig = t_sig.Filter("wgt > 0")
+    # t_sig = t_sig.Filter("wgt > 0")
     
     # retireve total number of events
     # for signal this is really the total number of events 
@@ -204,6 +260,7 @@ if __name__ == "__main__":
 
     for i in range(len(range_signal)-1):
         t_ = newTrigger(t_bkg)
+        t_.modifySel(0, ["Numba::L1FilterAdHoc(trigger_l1_pass)", []])
         t_.setRange([range_bkg[i], range_bkg[i+1]])
         t_.id_ = i
         the_trs.append(t_)
@@ -246,6 +303,9 @@ if __name__ == "__main__":
     #         np.arange(0.1,0.5,0.1), # 2nd Leading b-tag
     #     ]
     # ))
+    
+    
+    """
     
     # simple try with onliu btag filters 
     thresholds = list(product(
@@ -357,3 +417,5 @@ if __name__ == "__main__":
         
         
     f.close()
+    
+    """
